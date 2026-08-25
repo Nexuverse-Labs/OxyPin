@@ -1,0 +1,16 @@
+# Normalize line endings
+* text=auto
+
+# Shell scripts must keep LF
+gradlew text eol=lf
+*.sh text eol=lf
+
+# Windows scripts use CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files
+*.apk binary
+*.keystore binary
+*.jks binary
+*.png binary
