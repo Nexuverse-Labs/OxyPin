@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.view.Display;
 import android.widget.Toast;
 
@@ -16,6 +17,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
@@ -24,51 +26,55 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "OxyPin";
     private static final String SETTING_LOCK_TO_APP = "lock_to_app_enabled";
-
     private static final int LOCK_TASK_MODE_NONE = 0;
     private static final int LOCK_TASK_MODE_PINNED = 2;
-
     private volatile Handler mainHandler;
     private volatile Context cachedCtx;
 
     @Override
     public void handleLoadPackage(final LoadPackageParam lpp) {
-        if (!"android".equals(lpp.packageName)) {
-            return;
-        }
-        if (android.os.Process.myUid() != 1000) {
-            return;
-        }
-        log("loaded into system_server, sdk=" + android.os.Build.VERSION.SDK_INT);
-
-        final Thread waiter = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                Looper looper = null;
-                for (int i = 0; i < 200 && looper == null; i++) {
-                    looper = Looper.getMainLooper();
-                    if (looper == null) {
-                        try {
-                            Thread.sleep(250);
-                        } catch (InterruptedException ignored) {
-                            return;
+        final String pkg = lpp.packageName;
+        if ("android".equals(pkg)) {
+            if (android.os.Process.myUid() != 1000) {
+                return;
+            }
+            log("loaded into system_server, sdk=" + android.os.Build.VERSION.SDK_INT);
+            final Thread waiter = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    Looper looper = null;
+                    for (int i = 0; i < 200 && looper == null; i++) {
+                        looper = Looper.getMainLooper();
+                        if (looper == null) {
+                            try {
+                                Thread.sleep(250);
+                            } catch (InterruptedException ignored) {
+                                return;
+                            }
                         }
                     }
-                }
-                if (looper == null) {
-                    log("ERROR: main looper never appeared");
-                    return;
-                }
-                new Handler(looper).post(new Runnable() {
-                    @Override
-                    public void run() {
-                        initSystemSide(0);
+                    if (looper == null) {
+                        log("ERROR: main looper never appeared");
+                        return;
                     }
-                });
+                    new Handler(looper).post(new Runnable() {
+                        @Override
+                        public void run() {
+                            initSystemSide(0);
+                        }
+                    });
+                }
+            }, "OxyPin-init");
+            waiter.setDaemon(true);
+            waiter.start();
+            return;
+        }
+        if ("com.android.systemui".equals(pkg) || "com.android.launcher".equals(pkg)) {
+            try {
+                initRecentsSide(lpp);
+            } catch (Throwable ignored) {
             }
-        }, "OxyPin-init");
-        waiter.setDaemon(true);
-        waiter.start();
+        }
     }
 
     private void initSystemSide(final int attempt) {
@@ -92,7 +98,6 @@ public class MainHook implements IXposedHookLoadPackage {
         synchronized (this) {
             cachedCtx = ctx;
         }
-
         int token = new java.util.Random().nextInt(0x7ffffff0) | 1;
         try {
             final Class<?> secure = XposedHelpers.findClass("android.provider.Settings$Secure", null);
@@ -100,7 +105,6 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             logError("write token", t);
         }
-
         final IntentFilter f = new IntentFilter(OxyPin.ACTION_PIN);
         f.addAction(OxyPin.ACTION_UNPIN);
         try {
@@ -144,12 +148,11 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
                 final Context c = cachedCtx != null ? cachedCtx : ctx;
                 if (OxyPin.ACTION_PIN.equals(action)) {
-                    if (doPin(c)) {
+                    int reqTaskId = intent.getIntExtra(OxyPin.EXTRA_TASK_ID, -1);
+                    if (doPin(c, reqTaskId)) {
                         toast(c, tr(c, "Приложение закреплено", "App pinned"));
                     } else {
-                        toast(c, tr(c,
-                                "OxyPin: закрепить не удалось, смотри логи",
-                                "OxyPin: failed to pin, see LSPosed logs"));
+                        toast(c, tr(c, "OxyPin: закрепить не удалось, смотри логи", "OxyPin: failed to pin, see LSPosed logs"));
                     }
                 } else if (OxyPin.ACTION_UNPIN.equals(action)) {
                     final int st = lockTaskState();
@@ -160,9 +163,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (doUnpin()) {
                         toast(c, tr(c, "Приложение откреплено", "App unpinned"));
                     } else {
-                        toast(c, tr(c,
-                                "OxyPin: открепить не удалось, смотри логи",
-                                "OxyPin: failed to unpin, see LSPosed logs"));
+                        toast(c, tr(c, "OxyPin: открепить не удалось, смотри логи", "OxyPin: failed to unpin, see LSPosed logs"));
                     }
                 }
             } catch (Throwable t) {
@@ -172,6 +173,10 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private boolean doPin(Context ctx) {
+        return doPin(ctx, -1);
+    }
+
+    private boolean doPin(Context ctx, int requestedTaskId) {
         try {
             final int state = lockTaskState();
             if (state != LOCK_TASK_MODE_NONE) {
@@ -179,31 +184,29 @@ public class MainHook implements IXposedHookLoadPackage {
                 return false;
             }
             forceEnableLockToApp(ctx);
-
             final Object atms = atmsService();
-            final int taskId = findForegroundTaskId(atms);
+            int taskId = requestedTaskId;
+            if (taskId <= 0) {
+                taskId = findForegroundTaskId(atms);
+            }
             if (taskId <= 0) {
                 log("no foreground task found");
                 return false;
             }
-            Throwable lastErr = null;
             boolean ok = false;
             final Method m = findMethodByNeedle(atms, "startscreenpinning");
             if (m != null) {
-                log("pin method found: " + m);
                 try {
                     invokeStartByArity(m, atms, taskId);
                     ok = true;
                 } catch (Throwable t) {
-                    lastErr = unwrap(t);
-                    logError("invoke " + m.getName(), lastErr);
+                    logError("invoke " + m.getName(), unwrap(t));
                 }
             }
             if (!ok) {
                 try {
                     ok = pinViaLockTaskController(atms, taskId);
                 } catch (Throwable t) {
-                    lastErr = t;
                     logError("locktask pin", t);
                 }
             }
@@ -220,7 +223,6 @@ public class MainHook implements IXposedHookLoadPackage {
             boolean done = false;
             final Method m = findMethodByNeedle(atms, "stopscreenpinning");
             if (m != null) {
-                log("unpin method found: " + m);
                 try {
                     invokeStopByArity(m, atms);
                     done = true;
@@ -309,7 +311,6 @@ public class MainHook implements IXposedHookLoadPackage {
             log("no LockTaskController field on " + atms.getClass().getName());
             return false;
         }
-        log("LockTaskController instance: " + ltc.getClass().getName());
         final Object root = XposedHelpers.getObjectField(atms, "mRootWindowContainer");
         Object task = null;
         try {
@@ -323,7 +324,6 @@ public class MainHook implements IXposedHookLoadPackage {
             log("anyTaskForId returned null for " + taskId);
             return false;
         }
-
         final List<Method> cands = new ArrayList<Method>();
         Class<?> c = ltc.getClass();
         while (c != null && c != Object.class) {
@@ -335,7 +335,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             c = c.getSuperclass();
         }
-        log("pin candidates=" + cands.size());
         for (Method m : cands) {
             final Object[] args;
             try {
@@ -344,24 +343,19 @@ public class MainHook implements IXposedHookLoadPackage {
                 continue;
             }
             if (args == null) {
-                log("skip candidate, unsupported params: " + m);
                 continue;
             }
             try {
                 m.setAccessible(true);
                 m.invoke(ltc, args);
             } catch (Throwable t) {
-                logError("candidate " + m.getName(), unwrap(t));
                 continue;
             }
             final int st = lockTaskState();
             if (st != LOCK_TASK_MODE_NONE) {
-                log("SUCCESS via " + m + " state=" + st);
                 return true;
             }
-            log("invoked " + m.getName() + ", state unchanged (" + st + ")");
         }
-        dumpLockApis(ltc, atms);
         return false;
     }
 
@@ -398,32 +392,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         }
         return args;
-    }
-
-    private void dumpLockApis(Object ltc, Object atms) {
-        final StringBuilder sb = new StringBuilder("LTC dump: ");
-        Class<?> c = ltc.getClass();
-        while (c != null && c != Object.class) {
-            for (Method m : c.getDeclaredMethods()) {
-                final String ln = m.getName().toLowerCase();
-                if (ln.contains("lock") || ln.contains("pin")) {
-                    sb.append(m.toString()).append(" | ");
-                }
-            }
-            c = c.getSuperclass();
-        }
-        log(sb.toString());
-        final StringBuilder sb2 = new StringBuilder("ATMS locktask dump: ");
-        Class<?> c2 = atms.getClass();
-        while (c2 != null && c2 != Object.class) {
-            for (Method m : c2.getDeclaredMethods()) {
-                if (m.getName().toLowerCase().contains("locktask")) {
-                    sb2.append(m.toString()).append(" | ");
-                }
-            }
-            c2 = c2.getSuperclass();
-        }
-        log(sb2.toString());
     }
 
     private static Object findFieldOfTypeName(Object holder, String typeNamePart) {
@@ -489,6 +457,141 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    private void initRecentsSide(LoadPackageParam lpp) {
+        ClassLoader cl = lpp.classLoader;
+        try {
+            Class<?> amWrapper = XposedHelpers.findClass("com.android.systemui.shared.system.ActivityManagerWrapper", cl);
+            XposedBridge.hookAllMethods(amWrapper, "isScreenPinningEnabled", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    param.setResult(true);
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> proxy = XposedHelpers.findClass("com.android.quickstep.SystemUiProxy", cl);
+            XposedBridge.hookAllMethods(proxy, "startScreenPinning", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    int taskId = -1;
+                    for (Object a : param.args) {
+                        if (a instanceof Integer) {
+                            taskId = (Integer) a;
+                        }
+                    }
+                    if (param.args.length >= 2 && param.args[1] instanceof Integer) {
+                        for (int i = param.args.length - 1; i >= 0; i--) {
+                            if (param.args[i] instanceof Integer && (Integer) param.args[i] > 0) {
+                                taskId = (Integer) param.args[i];
+                                break;
+                            }
+                        }
+                    }
+                    Context ctx = null;
+                    try {
+                        Object c = XposedHelpers.getObjectField(param.thisObject, "mContext");
+                        if (c instanceof Context) ctx = (Context) c;
+                    } catch (Throwable ignored2) {
+                    }
+                    if (ctx == null) ctx = currentApplicationContext();
+                    if (ctx != null && sendPinViaBroadcast(ctx, taskId)) {
+                        param.setResult(null);
+                    }
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> pin = XposedHelpers.findClass("com.android.quickstep.TaskShortcutFactory$PinSystemShortcut", cl);
+            XposedBridge.hookAllMethods(pin, "onClick", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    int taskId = -1;
+                    try {
+                        Object taskView = XposedHelpers.getObjectField(param.thisObject, "mTaskView");
+                        if (taskView != null) {
+                            Object firstTask = XposedHelpers.callMethod(taskView, "getFirstTask");
+                            if (firstTask == null) firstTask = XposedHelpers.callMethod(taskView, "getTask");
+                            if (firstTask != null) {
+                                Object key = XposedHelpers.getObjectField(firstTask, "key");
+                                if (key != null) taskId = XposedHelpers.getIntField(key, "id");
+                            }
+                        }
+                    } catch (Throwable ignored2) {
+                    }
+                    Context ctx = null;
+                    try {
+                        if (param.args.length > 0 && param.args[0] instanceof android.view.View) {
+                            ctx = ((android.view.View) param.args[0]).getContext();
+                        }
+                    } catch (Throwable ignored2) {
+                    }
+                    if (ctx == null) {
+                        try {
+                            Object tv = XposedHelpers.getObjectField(param.thisObject, "mTaskView");
+                            if (tv instanceof android.view.View) ctx = ((android.view.View) tv).getContext();
+                        } catch (Throwable ignored2) {
+                        }
+                    }
+                    if (ctx == null) ctx = currentApplicationContext();
+                    if (ctx != null && sendPinViaBroadcast(ctx, taskId)) {
+                        param.setResult(null);
+                        try {
+                            XposedHelpers.callMethod(param.thisObject, "dismissTaskMenuView");
+                        } catch (Throwable t) {
+                            try {
+                                Object target = XposedHelpers.getObjectField(param.thisObject, "mTarget");
+                                if (target != null) XposedHelpers.callMethod(target, "dismissTaskMenuView");
+                            } catch (Throwable ignored3) {
+                            }
+                        }
+                    }
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private boolean sendPinViaBroadcast(Context ctx, int taskId) {
+        if (ctx == null) return false;
+        int token = 0;
+        try {
+            token = Settings.Secure.getInt(ctx.getContentResolver(), OxyPin.TOKEN_KEY);
+        } catch (Throwable ignored) {
+        }
+        if (token == 0) {
+            try {
+                Class<?> secure = XposedHelpers.findClass("android.provider.Settings$Secure", null);
+                token = (Integer) XposedHelpers.callStaticMethod(secure, "getInt", ctx.getContentResolver(), OxyPin.TOKEN_KEY);
+            } catch (Throwable ignored) {
+            }
+        }
+        if (token == 0) return false;
+        Intent i = new Intent(OxyPin.ACTION_PIN);
+        i.putExtra(OxyPin.EXTRA_TOKEN, token);
+        if (taskId > 0) i.putExtra(OxyPin.EXTRA_TASK_ID, taskId);
+        try {
+            ctx.sendBroadcast(i);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private Context currentApplicationContext() {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object cur = at.getMethod("currentApplication").invoke(null);
+            if (cur instanceof Context) return (Context) cur;
+            Object atObj = at.getMethod("currentActivityThread").invoke(null);
+            Object app = XposedHelpers.callMethod(atObj, "getApplication");
+            if (app instanceof Context) return (Context) app;
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
     private Handler mainHandler() {
         Handler h = mainHandler;
         if (h != null) return h;
@@ -508,7 +611,6 @@ public class MainHook implements IXposedHookLoadPackage {
     private void toast(final Context ctx, final String msg) {
         final Handler h = mainHandler();
         if (h == null) {
-            log("toast skipped (no handler): " + msg);
             return;
         }
         h.post(new Runnable() {

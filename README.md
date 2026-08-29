@@ -29,7 +29,9 @@ An Xposed module: tap the tile to pin the current app, tap again to unpin.
 
 OxyPin adds a Quick Settings tile that pins the current app. To unpin, swipe up from the bottom to the middle of the screen with the Home gesture (the standard Android unpin gesture), and the device will take you to the lock screen. While an app is pinned, you can keep using it, but you cannot exit it or open anything else - handy when you hand the phone to someone else.
 
-On stock Android pinning is reached through *Overview → app icon → Pin*. OxygenOS / ColorOS make this entry point hard to reach, so the module hooks `system_server` and calls the pinning APIs directly.
+On stock Android pinning is reached through *Overview → app icon → Pin*. OxygenOS / ColorOS hide the **Pin** button when gesture navigation is enabled and make this entry point hard to reach, so the module hooks `system_server` and calls the pinning APIs directly.
+
+Since v1.1 the module also restores the **Pin** button in the Recents task menu (*Overview → tap the app icon/dots → Pin*) even with gesture navigation enabled, and routes its click through the same secure pinning API as the tile, so pinning from Recents works with gestures as well.
 
 There is no launcher activity and no settings screen: install, enable in LSPosed, reboot, add the tile.
 
@@ -40,14 +42,16 @@ There is no launcher activity and no settings screen: install, enable in LSPosed
 1. `MainHook` is loaded into `system_server` (scope `android`) and waits for the main looper to start.
 2. On init it generates a random token and writes it to `Settings.Secure` under the `oxypin_token` key.
 3. `PinTile` (a `TileService`) reads the token and broadcasts `ru.oxypin.ACTION_PIN` or `ru.oxypin.ACTION_UNPIN`.
-4. The hook finds the foreground task and invokes `startScreenPinning` on `ActivityTaskManager`. The method signature differs between firmware versions, so it is resolved by name and parameter count; if that fails, the module falls back to `LockTaskController`. Unpinning uses `stopScreenPinning` or `clearLockedTasks`.
+4. The hook finds the target task (explicit `taskId` from Recents if provided, otherwise the foreground task) and invokes `startScreenPinning` on `ActivityTaskManager`. The method signature differs between firmware versions, so it is resolved by name and parameter count; if that fails, the module falls back to `LockTaskController`. Unpinning uses `stopScreenPinning` or `clearLockedTasks`.
 5. Broadcasts with a wrong token are ignored, so other apps cannot pin or unpin anything.
+6. For the Recents menu, `MainHook` is additionally loaded into `com.android.systemui` and `com.android.launcher` (System Launcher). It hooks `ActivityManagerWrapper.isScreenPinningEnabled` to always return `true` so the **Pin** option is never hidden, and intercepts `PinSystemShortcut.onClick` / `SystemUiProxy.startScreenPinning` to send the same secure `ACTION_PIN` broadcast with the selected `taskId` to `system_server`.
 
 ---
 
 ## ✨ Features
 
 - Pin / unpin the foreground app from any screen via the QS tile.
+- **Pin button in Recents always visible** — `Overview → app icon/dots → Pin` is restored even with gesture navigation (OxygenOS hides it by default) and pins via the same secure API.
 - Tile state follows the lock-task state.
 - Pin method resolution adapts to different OxygenOS / ColorOS builds.
 - Toasts in English and Russian, selected by system language.
@@ -58,9 +62,9 @@ There is no launcher activity and no settings screen: install, enable in LSPosed
 ## 📲 Installation
 
 1. Download an APK from [Releases](../../releases).
-2. Install it and enable the module in LSPosed with scope **System Framework (`android`)**.
+2. Install it and enable the module in LSPosed with scopes **System Framework (`android`)**, **System UI (`com.android.systemui`)** and **System Launcher (`com.android.launcher`)** — the latter two are required for the Recents **Pin** button to appear with gesture navigation.
 3. Reboot the device.
-4. Add the **Pin app** tile to the Quick Settings, or bind the tile to a gesture.
+4. Add the **Pin app** tile to the Quick Settings, or bind the tile to a gesture. The **Pin** option will also appear in Recents: `Overview → tap the app icon or ⋮ → Pin`.
 
 ---
 
